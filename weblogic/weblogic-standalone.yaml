@@ -1,0 +1,656 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation Template to deploy Weblogic server on Ec2'
+Parameters:
+  KeyName:
+    Description: AWS Keypair which will be used to lgin to instances.
+    Type: AWS::EC2::KeyPair::KeyName
+  VPC:
+    Description: in which VPC need to deploy
+    Type: AWS::EC2::VPC::Id
+  Subnet:
+    Description: Subnet to deploy WebLogic Admin instance
+    Type: AWS::EC2::Subnet::Id
+  Subnet1:
+    Description: Subnet to deploy Weblogic NodeManager
+    Type: AWS::EC2::Subnet::Id
+  Subnet2:
+    Description: Subnet to deploy Weblogic NodeManager
+    Type: AWS::EC2::Subnet::Id
+  AdminInstanceType:
+    Description: Instance type for WebLogic Admin server 
+    Type: String
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  Storage:
+    Description: Storage for servers
+    Type: String
+  adminUsername:
+    Description: username for admin console
+    Type: String
+  adminPassword:
+    Description: password for admin console
+    Type: String
+  clusterName:
+    Description: Name of the cluster
+    Type: String
+  NumberOfNodes:
+    Description: Number of dedicated node manager workers
+    Type: String
+    Default: 1
+  MaxNumberOfNodes:
+    Description: maximum number of node manager workers in case of autoscaling
+    Type: String
+    Default: 2
+  NodeInstanceType:
+    Type: String
+    Default: t3a.large
+  NodeGroupName:
+    Type: String
+    Default: test
+    Description: Do not change this.
+Conditions:
+  IsSingleInstance: !Equals
+    - !Ref NumberOfNodes
+    - 1
+  MaxNodes: !Not [ !Equals [ !Ref MaxNumberOfNodes, "" ] ]
+Mappings:
+  NodeType:
+    test:
+      OnDemandBaseCapacity: 0
+      OnDemandPercentageAboveBaseCapacity: 0
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    # S3 bucket
+    #aws-permission @cft s3:CreateBucket
+    #aws-permission @cft s3:DeleteBucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}"
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-s3bucket" }
+        - { Key: "resource", Value: "s3-bucket" }
+        - { Key: "owner", Value: "chitender" }
+        - { Key: "atlan:environment", Value: !Sub "weblogic" }
+        - { Key: "stack:name", Value: !Sub "${AWS::StackName}" }
+  InstanceRolePolicy:
+    Type: "AWS::IAM::Policy"
+    # Create eks node instance role policy
+    #aws-permission @cft iam:PutRolePolicy
+    #aws-permission @cft iam:DeleteRolePolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-NodeInstance-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "eks:*"
+              - "cloudformation:DescribeStackEvents"
+              - "cloudformation:DescribeStacks"
+              - "cloudformation:ListStacks"
+              - "cloudformation:CreateStack"
+              - "cloudformation:CreateChangeSet"
+              - "cloudformation:ListStacks"
+              - "cloudformation:UpdateStack"
+              - "cloudformation:DescribeStackResource"
+              - "cloudformation:DescribeStackResources"
+              - "cloudformation:ValidateTemplate"
+              - "cloudformation:DescribeChangeSet"
+              - "cloudformation:ExecuteChangeSet"
+              - "cloudformation:SignalResource"
+              - "iam:ListInstanceProfiles"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - "s3:GetObject"
+              - "s3:DeleteObject"
+              - "s3:PutObject"
+              - "s3:AbortMultipartUpload"
+              - "s3:ListMultipartUploadParts"
+              - "s3:GetBucketLocation"
+            Resource:
+              - !Sub "arn:aws:s3:::${S3Bucket}/*"
+          - Effect: "Allow"
+            Action:
+              - "s3:ListBucket"
+            Resource:
+              - !Sub "arn:aws:s3:::${S3Bucket}"
+      Roles:
+        - Ref: "InstanceRole"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref InstanceRole
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemReadOnlyAccess
+      Policies:
+        - PolicyName: s3BucketAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+  WeblogicInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    # Create security group
+    #aws-permission @cft ec2:DescribeSecurityGroups
+    #aws-permission @cft ec2:CreateSecurityGroup
+    #aws-permission @cft ec2:DeleteSecurityGroup
+    Properties:
+      GroupDescription: Security group for weblogic instance
+      GroupName: !Sub "${AWS::StackName}-atlanInstance-sg"
+      VpcId:
+        !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-weblogic-instance-sg" }
+        - { Key: "stack:service:type", Value: "security-group" }
+        - { Key: "stack:org:name", Value: "weblogic" }
+        - { Key: "stack:name", Value: !Sub "${AWS::StackName}" }
+  WeblogicSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow worker nodes to communicate with admin
+      GroupId: !Ref WeblogicInstanceSecurityGroup
+      SourceSecurityGroupId: !Ref WeblogicInstanceSecurityGroup
+      IpProtocol: -1
+      FromPort: 0
+      ToPort: 65535
+  WaitForNodeInstallWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  WeblogicInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: WaitForNodeInstallWaitHandle
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref AdminInstanceType
+      IamInstanceProfile: !Ref  InstanceProfile
+      KeyName: !Ref KeyName
+      SubnetId: !Ref Subnet
+      SecurityGroupIds:
+        - !Ref WeblogicInstanceSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            DeleteOnTermination: "true"
+            VolumeSize: !Ref Storage
+            Encrypted : true
+      UserData: !Base64
+        "Fn::Sub":
+          - |-
+            #!/bin/bash
+            set -o xtrace
+            yum update -y
+            yum install wget zip
+            mkdir -p /u01/software/
+            cd /u01/software/
+            wget https://chitender-artifacts.s3.ap-south-1.amazonaws.com/fmw_12.2.1.4.0_wls_Disk1_1of1.zip
+            wget https://chitender-artifacts.s3.ap-south-1.amazonaws.com/jdk-8u251-linux-x64.tar.gz
+            wget https://chitender-artifacts.s3.ap-south-1.amazonaws.com/setupSwap.main.sh
+            wget https://chitender-artifacts.s3.ap-south-1.amazonaws.com/setupSwap.sh
+            yum install unzip python python-setuptools python-pip -y
+            wget https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+            pip install aws-cfn-bootstrap-latest.tar.gz
+            chmod +x setupSwap.sh setupSwap.main.sh
+            ./setupSwap.sh
+            echo “Checking if WebLogic Server is already runing. If its running, stopping it and reinstalling it from scratch”
+            pkill -9 java
+            pkill -9 Weblogic
+            rm -fr /u01/oracle/wlsdomains/base_domain
+            rm -fr /u01/oracle/fmw/wlserver_10.3
+            rm -fr /u01/jdk/jdk7
+            pkill -9 java
+            echo “Initializing the Installation”
+            groupadd oinstall
+            useradd -g oinstall oracle
+            mkdir -p /u01/app/oracle
+            cd /u01/app/oracle
+            tar -zxf /u01/software/jdk-8u251-linux-x64.tar.gz
+            ln -s jdk1.8.0_251 jdk1.8.0
+            unzip /u01/software/fmw_12.2.1.4.0_wls_Disk1_1of1.zip
+            # Setting up weblogic
+            mkdir -p /u01/app/oracle/middleware
+            mkdir -p /u01/app/oracle/config/domains
+            mkdir -p /u01/app/oracle/config/applications
+            chown -R oracle:oinstall /u01
+            chmod -R 775 /u01/
+            export MW_HOME=/u01/app/oracle/middleware
+            export WLS_HOME=$MW_HOME/wlserver
+            export WL_HOME=$WLS_HOME
+            # Set to the appropriate JAVA_HOME.
+            export JAVA_HOME=/u01/app/oracle/jdk1.8.0
+            export PATH=$JAVA_HOME/bin:$PATH
+            cat <<EOF > /u01/software/wls.rsp
+            [ENGINE]
+            Response File Version=1.0.0.0.0
+            [GENERIC]
+            ORACLE_HOME=/u01/app/oracle/middleware
+            INSTALL_TYPE=WebLogic Server
+            MYORACLESUPPORT_USERNAME=''
+            MYORACLESUPPORT_PASSWORD=''
+            DECLINE_SECURITY_UPDATES=true
+            SECURITY_UPDATES_VIA_MYORACLESUPPORT=false
+            PROXY_HOST=''
+            PROXY_PORT=''
+            PROXY_USER=''
+            PROXY_PWD=''
+            COLLECTOR_SUPPORTHUB_URL=''
+            EOF
+            cat <<EOF > /u01/software/oraInst.loc
+            inventory_loc=/u01/app/oraInventory
+            inst_group=oinstall
+            EOF
+            sudo -u oracle /u01/app/oracle/jdk1.8.0/bin/java -Xmx1024m -jar /u01/app/oracle/fmw_12.2.1.4.0_wls.jar -silent -responseFile /u01/software/wls.rsp -invPtrLoc /u01/software/oraInst.loc
+            ######
+            runuser -l oracle -c ' mkdir -p /u01/app/oracle/middleware/wlsdomains;cd /u01/app/oracle/middleware/wlsdomains;/u01/app/oracle/middleware/wlserver/server/bin/setWLSEnv.sh;export CLASSPATH=/u01/app/oracle/jdk1.8.0_251/lib/tools.jar:/u01/app/oracle/middleware/wlserver/modules/features/wlst.wls.classpath.jar:/u01/app/oracle/middleware/wlserver/server/lib/weblogic.jar; nohup /u01/app/oracle/jdk1.8.0/bin/java -Dweblogic.management.username=${adminUsername} -Dweblogic.management.password=${adminPassword} -Dweblogic.Domain=wlsdomains -Dweblogic.Name=myMedRecServer -Dweblogic.ListenPort=8001 -Dweblogic.management.GenerateDefaultConfig=true weblogic.Server &'
+            sleep 120
+            cat <<EOF > /home/oracle/myDomain-cluster.properties
+            admin.username=${adminUsername}
+            admin.password=${adminPassword}
+            admin.url=t3://$HOSTNAME:8001
+
+            # Cluster details
+            cluster.name=${clusterName}
+            cluster.address=$HOSTNAME:7002,$HOSTNAME:7003
+            EOF
+            cat <<EOF > /home/oracle/create_cluster.py
+            #!/usr/bin/python
+            # Author : Tim Hall
+            # Save Script as : create_cluster.py
+
+            import time
+            import getopt
+            import sys
+            import re
+
+            # Get location of the properties file.
+            properties = ''
+            try:
+              opts, args = getopt.getopt(sys.argv[1:],"p:h::",["properies="])
+            except getopt.GetoptError:
+              print 'create_cluster.py -p <path-to-properties-file>'
+              sys.exit(2)
+            for opt, arg in opts:
+              if opt == '-h':
+                  print 'create_cluster.py -p <path-to-properties-file>'
+                  sys.exit()
+              elif opt in ("-p", "--properties"):
+                  properties = arg
+            print 'properties=', properties
+
+            # Load the properties from the properties file.
+            from java.io import FileInputStream
+
+            propInputStream = FileInputStream(properties)
+            configProps = Properties()
+            configProps.load(propInputStream)
+
+            # Set all variables from values in properties file.
+            adminUsername=configProps.get("admin.username")
+            adminPassword=configProps.get("admin.password")
+            adminURL=configProps.get("admin.url")
+            clusterName=configProps.get("cluster.name")
+            clusterAddress=configProps.get("cluster.address")
+
+            # Display the variable values.
+            print 'adminUsername=', adminUsername
+            print 'adminPassword=', adminPassword
+            print 'adminURL=', adminURL
+            print 'clusterName=', clusterName
+            print 'clusterAddress=', clusterAddress
+
+            # Connect to the AdminServer.
+            connect(adminUsername, adminPassword, adminURL)
+
+            edit()
+            startEdit()
+
+            # Create cluster.
+            cd('/')
+            cmo.createCluster(clusterName)
+
+            cd('/Clusters/' + clusterName)
+            cmo.setClusterMessagingMode('unicast')
+            cmo.setClusterBroadcastChannel('')
+            cmo.setClusterAddress(clusterAddress)
+
+            save()
+            activate()
+
+            disconnect()
+            exit()
+            EOF
+            runuser -l oracle -c ' export MW_HOME=/u01/app/oracle/middleware;export WLS_HOME=$MW_HOME/wlserver;export WL_HOME=$WLS_HOME;export JAVA_HOME=/u01/app/oracle/jdk1.8.0;export PATH=$JAVA_HOME/bin:$PATH;export DOMAIN_HOME=/u01/app/oracle/middleware/wlsdomains/;export CLASSPATH=/u01/app/oracle/jdk1.8.0_251/lib/tools.jar:/u01/app/oracle/middleware/wlserver/modules/features/wlst.wls.classpath.jar:/u01/app/oracle/middleware/wlserver/server/lib/weblogic.jar;/u01/app/oracle/jdk1.8.0/bin/java weblogic.WLST create_cluster.py -p myDomain-cluster.properties'
+            runuser -l oracle -c ' export DOMAIN_HOME=/u01/app/oracle/middleware/wlsdomains; nohup /u01/app/oracle/middleware/wlsdomains/bin/startNodeManager.sh &'
+            runuser -l oracle -c ' export DOMAIN_HOME=/u01/app/oracle/middleware/wlsdomains; mkdir -p $DOMAIN_HOME/servers/AdminServer/security;echo "username=${adminUsername}" > $DOMAIN_HOME/servers/AdminServer/security/boot.properties;echo "password=${adminPassword}" >> $DOMAIN_HOME/servers/AdminServer/security/boot.properties'
+            runuser -l oracle -c ' /u01/app/oracle/middleware/wlserver/server/bin/setWLSEnv.sh;export CLASSPATH=/u01/app/oracle/jdk1.8.0_251/lib/tools.jar:/u01/app/oracle/middleware/wlserver/modules/features/wlst.wls.classpath.jar:/u01/app/oracle/middleware/wlserver/server/lib/weblogic.jar;export DOMAIN_HOME=/u01/app/oracle/middleware/wlsdomains;cd /u01/app/oracle/middleware/wlserver/common/bin;./pack.sh -managed=true -domain=$DOMAIN_HOME -template=/u01/app/oracle/middleware/wlsdomains-template.jar -template_name=clusterDomain'
+            aws s3 cp /u01/app/oracle/middleware/wlsdomains-template.jar s3://${S3Bucket}/
+            /opt/aws/bin/cfn-signal -e 0 "${WaitForNodeInstallWaitHandle}"
+
+          - adminUsername: !Ref adminUsername
+            adminPassword: !Ref adminPassword
+            clusterName: !Ref clusterName
+            S3Bucket: !Ref S3Bucket
+            WaitForNodeInstallWaitHandle: !Ref WaitForNodeInstallWaitHandle
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-weblogic-instance" }
+        - { Key: "stack:service:type", Value: "ec2-instance" }
+        - { Key: "stack:org:name", Value: "weblogic" }
+        - { Key: "stack:name", Value: !Sub "${AWS::StackName}" }
+  WaitForNodeInstall:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: WeblogicInstance
+    Properties:
+      Handle:
+        Ref: WaitForNodeInstallWaitHandle
+      Timeout: '1200'
+  NodeManagerLaunchTemplate:
+    DependsOn: WaitForNodeInstall
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: "weblogic-worker-node"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WeblogicInstanceSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref Storage
+              VolumeType: gp2
+              DeleteOnTermination: true
+        UserData: !Base64
+          "Fn::Sub":
+            - |-
+              #!/bin/bash
+              set -o xtrace
+              yum update -y
+              yum install wget zip
+              mkdir -p /u01/software/
+              cd /u01/software/
+              wget https://chitender-artifacts.s3.ap-south-1.amazonaws.com/fmw_12.2.1.4.0_wls_Disk1_1of1.zip
+              wget https://chitender-artifacts.s3.ap-south-1.amazonaws.com/jdk-8u251-linux-x64.tar.gz
+              wget https://chitender-artifacts.s3.ap-south-1.amazonaws.com/setupSwap.main.sh
+              wget https://chitender-artifacts.s3.ap-south-1.amazonaws.com/setupSwap.sh
+              chmod +x setupSwap.sh setupSwap.main.sh
+              ./setupSwap.sh
+              echo “Checking if WebLogic Server is already runing. If its running, stopping it and reinstalling it from scratch”
+              pkill -9 java
+              pkill -9 Weblogic
+              rm -fr /u01/oracle/wlsdomains/base_domain
+              rm -fr /u01/oracle/fmw/wlserver_10.3
+              rm -fr /u01/jdk/jdk7
+              pkill -9 java
+              echo “Initializing the Installation”
+              groupadd oinstall
+              useradd -g oinstall oracle
+              mkdir -p /u01/app/oracle
+              cd /u01/app/oracle
+              tar -zxf /u01/software/jdk-8u251-linux-x64.tar.gz
+              ln -s jdk1.8.0_251 jdk1.8.0
+              unzip /u01/software/fmw_12.2.1.4.0_wls_Disk1_1of1.zip
+              # Setting up weblogic
+              mkdir -p /u01/app/oracle/middleware
+              mkdir -p /u01/app/oracle/config/domains
+              mkdir -p /u01/app/oracle/config/applications
+              chown -R oracle:oinstall /u01
+              chmod -R 775 /u01/
+              export MW_HOME=/u01/app/oracle/middleware
+              export WLS_HOME=$MW_HOME/wlserver
+              export WL_HOME=$WLS_HOME
+              # Set to the appropriate JAVA_HOME.
+              export JAVA_HOME=/u01/app/oracle/jdk1.8.0
+              export PATH=$JAVA_HOME/bin:$PATH
+              cat <<EOF > /u01/software/wls.rsp
+              [ENGINE]
+              Response File Version=1.0.0.0.0
+              [GENERIC]
+              ORACLE_HOME=/u01/app/oracle/middleware
+              INSTALL_TYPE=WebLogic Server
+              MYORACLESUPPORT_USERNAME=''
+              MYORACLESUPPORT_PASSWORD=''
+              DECLINE_SECURITY_UPDATES=true
+              SECURITY_UPDATES_VIA_MYORACLESUPPORT=false
+              PROXY_HOST=''
+              PROXY_PORT=''
+              PROXY_USER=''
+              PROXY_PWD=''
+              COLLECTOR_SUPPORTHUB_URL=''
+              EOF
+              cat <<EOF > /u01/software/oraInst.loc
+              inventory_loc=/u01/app/oraInventory
+              inst_group=oinstall
+              EOF
+              
+              cat <<EOF > /home/oracle/myDomain-cluster.properties
+              admin.username=${adminUsername}
+              admin.password=${adminPassword}
+              admin.url=t3://${adminUrl}:8001
+              Machine=$HOSTNAME
+
+              # Cluster details
+              cluster.name=${clusterName}
+              cluster.address=$HOSTNAME:7002,$HOSTNAME:7003
+              EOF
+              cat <<EOF > /home/oracle/join_cluster.py
+              #!/usr/bin/python
+              # Author : Tim Hall
+              # Save Script as : create_cluster.py
+
+              import time
+              import getopt
+              import sys
+              import re
+
+              # Get location of the properties file.
+              properties = ''
+              try:
+                opts, args = getopt.getopt(sys.argv[1:],"p:h::",["properies="])
+              except getopt.GetoptError:
+                print 'create_cluster.py -p <path-to-properties-file>'
+                sys.exit(2)
+              for opt, arg in opts:
+                if opt == '-h':
+                    print 'create_cluster.py -p <path-to-properties-file>'
+                    sys.exit()
+                elif opt in ("-p", "--properties"):
+                    properties = arg
+              print 'properties=', properties
+
+              # Load the properties from the properties file.
+              from java.io import FileInputStream
+
+              propInputStream = FileInputStream(properties)
+              configProps = Properties()
+              configProps.load(propInputStream)
+
+              # Set all variables from values in properties file.
+              adminUsername=configProps.get("admin.username")
+              adminPassword=configProps.get("admin.password")
+              adminURL=configProps.get("admin.url")
+              clusterName=configProps.get("cluster.name")
+              clusterAddress=configProps.get("cluster.address")
+              machine=configProps.get("Machine")
+
+              # Display the variable values.
+              print 'adminUsername=', adminUsername
+              print 'adminPassword=', adminPassword
+              print 'adminURL=', adminURL
+              print 'clusterName=', clusterName
+              print 'clusterAddress=', clusterAddress
+
+              # Connect to the AdminServer.
+              connect(adminUsername, adminPassword, adminURL)
+              edit()
+              startEdit()
+              cd('/')
+              cmo.createUnixMachine('$HOSTNAME')
+              cd('/Machines/$HOSTNAME/NodeManager/$HOSTNAME')
+              cmo.setListenAddress('$HOSTNAME')
+              cmo.setListenPort(5556)
+              cmo.setNMType('plain')
+              save()
+              activate()
+              nmEnroll('/u01/app/oracle/middleware/wlsdomains/','/u01/app/oracle/middleware/wlsdomains/nodemanager')
+
+              disconnect()
+              exit()
+              EOF
+              # WLS
+              sudo -u oracle /u01/app/oracle/jdk1.8.0/bin/java -Xmx1024m -jar /u01/app/oracle/fmw_12.2.1.4.0_wls.jar -silent -responseFile /u01/software/wls.rsp -invPtrLoc /u01/software/oraInst.loc
+              aws s3 cp s3://${S3Bucket}/wlsdomains-template.jar /u01/app/oracle/middleware/
+              chown oracle /u01/app/oracle/middleware/wlsdomains-template.jar
+              runuser -l oracle -c ' export DOMAIN_HOME=/u01/app/oracle/middleware/wlsdomains;cd /u01/app/oracle/middleware/wlserver/common/bin;./unpack.sh -domain=$DOMAIN_HOME -template=/u01/app/oracle/middleware/wlsdomains-template.jar'
+              cat <<EOF > /u01/app/oracle/middleware/wlsdomains/nodemanager/nodemanager.properties
+              ListenAddress=$HOSTNAME
+              ListenPort=5556
+              SecureListener=false
+              EOF
+              runuser -l oracle -c 'export NODEMGR_HOME=/u01/app/oracle/middleware/user_projects/nodemanager/$HOSTNAME;source /u01/app/oracle/middleware/wlserver/server/bin/setWLSEnv.sh;export CLASSPATH=/u01/app/oracle/jdk1.8.0_251/lib/tools.jar:/u01/app/oracle/middleware/wlserver/modules/features/wlst.wls.classpath.jar:/u01/app/oracle/middleware/wlserver/server/lib/weblogic.jar;/u01/app/oracle/jdk1.8.0/bin/java weblogic.WLST join_cluster.py -p myDomain-cluster.properties; /u01/app/oracle/middleware/wlsdomains/bin/startNodeManager.sh'
+            - adminUsername: !Ref adminUsername
+              adminPassword: !Ref adminPassword
+              clusterName: !Ref clusterName
+              adminUrl: !GetAtt WeblogicInstance.PrivateDnsName
+
+        TagSpecifications:
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub "${AWS::StackName}-weblogic-worker-volume" }
+              - { Key: "stack:service:type", Value: "ec2-instance" }
+              - { Key: "stack:org:name", Value: "weblogic" }
+              - { Key: "stack:name", Value: !Sub "${AWS::StackName}" }
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${AWS::StackName}-weblogic-worker-instance" }
+              - { Key: "stack:service:type", Value: "ec2-instance" }
+              - { Key: "stack:org:name", Value: "weblogic" }
+              - { Key: "stack:name", Value: !Sub "${AWS::StackName}" }
+  NodeGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-weblogic-worker-instance"
+      DesiredCapacity: !Ref NumberOfNodes
+      MinSize: !Ref NumberOfNodes
+      MaxSize: !If [ MaxNodes, !Ref MaxNumberOfNodes, !Ref NumberOfNodes ]
+      VPCZoneIdentifier: [ !Ref Subnet1, !Ref Subnet2 ]
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandBaseCapacity: !FindInMap
+            - NodeType
+            - !Ref NodeGroupName
+            - OnDemandBaseCapacity
+          OnDemandPercentageAboveBaseCapacity: !FindInMap
+            - NodeType
+            - !Ref NodeGroupName
+            - OnDemandPercentageAboveBaseCapacity
+          SpotAllocationStrategy: "lowest-price"
+          SpotInstancePools: 2
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref   NodeManagerLaunchTemplate
+            Version: !GetAtt   NodeManagerLaunchTemplate.LatestVersionNumber
+          Overrides:
+            - InstanceType: !Ref NodeInstanceType 
+      Tags:
+        - Key: Name
+          Value: !Sub "weblogic-asg"
+          PropagateAtLaunch: true
+        - Key: "resource"
+          Value: "ec2-autoscalinggroup"
+          PropagateAtLaunch: true
+        - Key: "stack:name"
+          Value: !Sub "${AWS::StackName}"
+          PropagateAtLaunch: true
+        - Key: "nodegroup"
+          Value: !Sub "weblogic"
+          PropagateAtLaunch: true
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    # EKS workers scale up policy
+    #aws-permission @cft autoscaling:PutScalingPolicy
+    #aws-permission @cft autoscaling:DeletePolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: NodeGroup
+      Cooldown: '60'
+      ScalingAdjustment: '1'
+  ScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    # EKS workers scale down policy
+    #aws-permission @cft autoscaling:PutScalingPolicy
+    #aws-permission @cft autoscaling:DeletePolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: NodeGroup
+      Cooldown: '60'
+      ScalingAdjustment: "-1"
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    # EKS worker alarm for high CPU
+    #aws-permission @cft cloudwatch:PutMetricAlarm
+    Properties:
+      AlarmDescription: Scale-up if CPU > 90% for 5 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '90'
+      AlarmActions:
+      - Ref: ScaleUpPolicy
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value:
+          Ref: NodeGroup
+      ComparisonOperator: GreaterThanThreshold
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    # EKS worker alarm for low CPU
+    #aws-permission @cft cloudwatch:PutMetricAlarm
+    Properties:
+      AlarmDescription: Scale-down if CPU < 60% for 5 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '60'
+      AlarmActions:
+      - Ref: ScaleDownPolicy
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value:
+          Ref: NodeGroup
+      ComparisonOperator: LessThanThreshold
+ 
+Outputs:
+  AdminConsoleEndpoint:
+    Description: Endpoint to access Admin console
+    Value: !GetAtt WeblogicInstance.PrivateDnsName
+
